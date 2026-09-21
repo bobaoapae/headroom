@@ -4053,8 +4053,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             return "partial"
         return "missing"
 
-    def _build_recent_request_payload(limit: int = RECENT_REQUEST_LOG_WINDOW) -> dict[str, Any]:
-        recent_request_logs = proxy.logger.get_recent(limit) if proxy.logger else []
+    def _build_recent_request_payload(
+        limit: int = RECENT_REQUEST_LOG_WINDOW,
+        recent_request_logs: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if recent_request_logs is None:
+            recent_request_logs = proxy.logger.get_recent(limit) if proxy.logger else []
+        else:
+            recent_request_logs = recent_request_logs[-limit:]
         dashboard_recent_requests = []
         for log in reversed(recent_request_logs):
             token_accounting_status = _recent_request_token_accounting_status(log)
@@ -4131,6 +4137,84 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         _throughput_cache["value"] = None
             throughput = _throughput_cache["value"]
 
+        def _collect_blocking_stats() -> dict[str, Any]:
+            """Collect the blocking portions of the `/stats` snapshot."""
+            compression_stats = get_compression_store().get_stats()
+            telemetry_stats = get_telemetry_collector().get_stats()
+            feedback_stats = get_compression_feedback().get_stats()
+            prefix_cache_stats = _build_prefix_cache_stats(m, proxy.cost_tracker)
+            persistent_savings = m.savings_tracker.stats_preview()
+
+            recent_request_logs = proxy.logger.get_recent(10_000) if proxy.logger else []
+            recent_request_payload = _build_recent_request_payload(
+                recent_request_logs=recent_request_logs
+            )
+
+            # Tool-schema deferral savings: tool-definition tokens kept out of the
+            # model's context by deferring heavy schemas until they're needed
+            # (native tool-search injection + any registered turn-hook tools
+            # rewrite). Attributed to Headroom only — see _tool_schema_saved_from_tags.
+            # Aggregated over the recent request-log window.
+            tool_schema_tokens = 0
+            tool_schema_requests = 0
+            for recent_request_log in recent_request_logs:
+                tool_schema_saved = _tool_schema_saved_from_tags(
+                    recent_request_log.get("tags")
+                )
+                if tool_schema_saved > 0:
+                    tool_schema_tokens += tool_schema_saved
+                    tool_schema_requests += 1
+
+            agent_usage = _build_agent_usage_summary(
+                recent_request_logs,
+                requests_by_provider=_remap_provider_counts(
+                    requests_by_provider_snapshot, proxy.config
+                ),
+                requests_by_model=requests_by_model_snapshot,
+                global_before_tokens=proxy_total_before_compression,
+                global_after_tokens=m.tokens_input_total,
+                global_tokens_saved=proxy_compression_tokens,
+                global_output_tokens=m.tokens_output_total,
+            )
+
+            return {
+                "compression_stats": compression_stats,
+                "telemetry_stats": telemetry_stats,
+                "feedback_stats": feedback_stats,
+                "prefix_cache_stats": prefix_cache_stats,
+                "persistent_savings": persistent_savings,
+                "recent_request_logs": recent_request_logs,
+                "recent_request_payload": recent_request_payload,
+                "tool_schema_tokens": tool_schema_tokens,
+                "tool_schema_requests": tool_schema_requests,
+                "agent_usage": agent_usage,
+                "toin_stats": get_toin().get_stats(),
+                "cost_stats": (
+                    proxy.cost_tracker.stats() if proxy.cost_tracker else None
+                ),
+            }
+
+        proxy_compression_tokens = m.tokens_saved_total
+        all_layers_tokens_saved = proxy_compression_tokens + m.tool_search_saved_total
+        total_tokens_before = m.tokens_input_total + all_layers_tokens_saved
+        proxy_total_before_compression = m.tokens_input_total + proxy_compression_tokens
+        attempted_input_tokens = getattr(m, "attempted_input_tokens_total", 0)
+        requests_by_provider_snapshot = dict(m.requests_by_provider)
+        requests_by_model_snapshot = dict(m.requests_by_model)
+        blocking_stats = await asyncio.to_thread(_collect_blocking_stats)
+        compression_stats = blocking_stats["compression_stats"]
+        telemetry_stats = blocking_stats["telemetry_stats"]
+        feedback_stats = blocking_stats["feedback_stats"]
+        prefix_cache_stats = blocking_stats["prefix_cache_stats"]
+        persistent_savings = blocking_stats["persistent_savings"]
+        recent_request_logs = blocking_stats["recent_request_logs"]
+        recent_request_payload = blocking_stats["recent_request_payload"]
+        tool_schema_tokens = blocking_stats["tool_schema_tokens"]
+        tool_schema_requests = blocking_stats["tool_schema_requests"]
+        agent_usage = blocking_stats["agent_usage"]
+        toin_stats = blocking_stats["toin_stats"]
+        cost_stats = blocking_stats["cost_stats"]
+
         # Calculate average latency
         avg_latency_ms = round(m.latency_sum_ms / m.latency_count, 2) if m.latency_count > 0 else 0
         min_latency_ms = (
@@ -4161,41 +4245,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         def _pct(part: int | float, whole: int | float) -> float:
             return round((float(part) / float(whole)) * 100.0, 2) if whole else 0.0
 
-        # Get compression store stats
-        store = get_compression_store()
-        compression_stats = store.get_stats()
-
-        # Get telemetry/TOIN stats
-        telemetry = get_telemetry_collector()
-        telemetry_stats = telemetry.get_stats()
-
-        # Get feedback loop stats
-        feedback = get_compression_feedback()
-        feedback_stats = feedback.get_stats()
-
-        # Build prefix cache stats once (used in both prefix_cache and cost)
-        prefix_cache_stats = _build_prefix_cache_stats(m, proxy.cost_tracker)
-
-        # Calculate total tokens before Headroom-side reduction.
-        proxy_compression_tokens = m.tokens_saved_total
-        # "All layers" must include tool-schema deferral (the tool_search layer
-        # enumerated in by_layer below) — otherwise the advertised total omits it.
-        all_layers_tokens_saved = proxy_compression_tokens + m.tool_search_saved_total
-        total_tokens_before = m.tokens_input_total + all_layers_tokens_saved
-        proxy_total_before_compression = m.tokens_input_total + proxy_compression_tokens
-        # `attempted_input_tokens` is the compressible-only denominator
-        # (extracted units + tool schema). The "active compression"
-        # ratio is what fraction of the tokens we *tried* to compress
-        # actually got compressed. Excludes prefix-frozen content
-        # (user/system messages, prior turns) we never touched —
-        # otherwise the ratio is dominated by content we deliberately
-        # avoided changing for prefix-cache safety.
-        # `attempted_input_tokens_total` is already pre-compression: it
-        # accumulates `unit.tokens_before` for each eligible unit that
-        # reached the router, plus the original (pre-compaction) tool
-        # schema size. So the savings rate is plain `saved / attempted`
-        # — adding `saved` again would double-count.
-        attempted_input_tokens = getattr(m, "attempted_input_tokens_total", 0)
         # New-content denominator: what the provider actually billed as
         # non-cache-read input (uncached + cache-write tokens, summed
         # across providers from response usage). Unlike
@@ -4252,32 +4301,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Build unified savings summary (all layers)
         cache_net_usd = prefix_cache_stats.get("totals", {}).get("net_savings_usd", 0.0)
         total_tokens_all_layers = all_layers_tokens_saved
-        persistent_savings = m.savings_tracker.stats_preview()
         display_session = persistent_savings.get("display_session", {})
-        recent_request_logs = proxy.logger.get_recent(10_000) if proxy.logger else []
-        recent_request_payload = _build_recent_request_payload()
-
-        # Tool-schema deferral savings: tool-definition tokens kept out of the
-        # model's context by deferring heavy schemas until they're needed
-        # (native tool-search injection + any registered turn-hook tools
-        # rewrite). Attributed to Headroom only — see _tool_schema_saved_from_tags.
-        # Aggregated over the recent request-log window.
-        tool_schema_tokens = 0
-        tool_schema_requests = 0
-        for _ts_log in recent_request_logs:
-            _ts_saved = _tool_schema_saved_from_tags(_ts_log.get("tags"))
-            if _ts_saved > 0:
-                tool_schema_tokens += _ts_saved
-                tool_schema_requests += 1
-        agent_usage = _build_agent_usage_summary(
-            recent_request_logs,
-            requests_by_provider=_remap_provider_counts(dict(m.requests_by_provider), proxy.config),
-            requests_by_model=dict(m.requests_by_model),
-            global_before_tokens=proxy_total_before_compression,
-            global_after_tokens=m.tokens_input_total,
-            global_tokens_saved=proxy_compression_tokens,
-            global_output_tokens=m.tokens_output_total,
-        )
 
         # Output-side reduction (counterfactual estimate from the shaper's
         # ledger). Distinct from input compression above: these are OUTPUT
@@ -4551,10 +4575,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "litellm_available": LITELLM_AVAILABLE,
             "persistent_savings": persistent_savings,
             "prefix_cache": prefix_cache_stats,
-            "cost": _merge_cost_stats(
-                proxy.cost_tracker.stats() if proxy.cost_tracker else None,
-                prefix_cache_stats,
-            ),
+            "cost": _merge_cost_stats(cost_stats, prefix_cache_stats),
             "compression": {
                 "ccr_entries": compression_stats.get("entry_count", 0),
                 "ccr_max_entries": compression_stats.get("max_entries", 0),
@@ -4588,7 +4609,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     if p.get("retrieval_rate", 0) > 0.3
                 ),
             },
-            "toin": get_toin().get_stats(),
+            "toin": toin_stats,
             "proxy_inbound": proxy.metrics.inbound_snapshot(),
             "cache": await proxy.cache.stats() if proxy.cache else None,
             "rate_limiter": await proxy.rate_limiter.stats() if proxy.rate_limiter else None,
@@ -4680,7 +4701,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             payload = dict(await _get_cached_stats_payload())
             if include_sensitive:
                 # Refresh the per-request tail on top of the cached snapshot.
-                payload.update(_build_recent_request_payload())
+                payload.update(await asyncio.to_thread(_build_recent_request_payload))
                 payload["config"] = _dashboard_config_payload()
         else:
             payload = await _build_stats_payload()

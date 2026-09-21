@@ -21,11 +21,12 @@ but the label is now accurate for any future Unicode payload).
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import sys
 from collections import deque
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any
@@ -35,6 +36,13 @@ if TYPE_CHECKING:
 
 from headroom.proxy import request_log_redaction_policy
 from headroom.proxy.models import RequestLog
+
+# Fields ``get_recent`` never returns. Kept as a module constant so the
+# projection below stays in step with the docstring.
+RECENT_OMITTED_FIELDS = ("request_messages", "compressed_messages", "response_content")
+_RECENT_FIELDS: tuple[str, ...] = tuple(
+    f.name for f in fields(RequestLog) if f.name not in RECENT_OMITTED_FIELDS
+)
 
 IMAGE_BASE64_REDACT_THRESHOLD_BYTES = (
     request_log_redaction_policy.IMAGE_BASE64_REDACT_THRESHOLD_BYTES
@@ -144,17 +152,35 @@ class RequestLogger:
                 pass  # Graceful degradation: memory-only logging continues
 
     def get_recent(self, n: int = 100) -> list[dict]:
-        """Get recent log entries (without request/compressed messages and response_content)."""
+        """Get recent log entries (without request/compressed messages and response_content).
+
+        Project the kept fields directly instead of going through ``asdict``.
+        ``asdict`` rebuilds and deep-copies *every* field and only then drops
+        the three omitted ones, so `/stats` paid for a full copy of the
+        10,000-entry buffer — including the message bodies — and threw most of
+        it away, twice per request (``server.py`` :4057 and :4257).
+
+        The remaining fields that can hold mutable state are still deep-copied,
+        so the previous guarantee holds: nothing a caller does to a returned
+        row — including a nested dict inside ``savings_breakdown`` or ``tags``
+        — can reach the buffered ``RequestLog``. What is skipped is the copy of
+        the omitted fields and the rebuild of the immutable scalars, which are
+        safe to share. Output is unchanged.
+        """
         # Convert deque to list for slicing (deque doesn't support slicing)
         entries = list(self._logs)[-n:]
-        return [
-            {
-                k: v
-                for k, v in asdict(e).items()
-                if k not in ("request_messages", "compressed_messages", "response_content")
-            }
-            for e in entries
-        ]
+        recent = []
+        for e in entries:
+            row = {k: getattr(e, k) for k in _RECENT_FIELDS}
+            for k in _RECENT_FIELDS:
+                v = row[k]
+                # ``tags`` is dict[str, Any] and ``savings_breakdown`` is
+                # list[dict[str, Any]]: a shallow copy would still share the
+                # nested children with the buffered entry, so copy in full.
+                if type(v) is dict or type(v) is list:
+                    row[k] = copy.deepcopy(v)
+            recent.append(row)
+        return recent
 
     def get_recent_with_messages(self, n: int = 20) -> list[dict]:
         """Get recent log entries including full request/response messages."""
