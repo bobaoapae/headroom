@@ -831,6 +831,7 @@ class _SymbolAnalysis:
 
     scores: dict[str, float] = field(default_factory=dict)
     calls: dict[str, set[str]] = field(default_factory=dict)
+    calls_by_bare_name: dict[str, set[str]] = field(default_factory=dict)
     ref_counts: dict[str, int] = field(default_factory=dict)
     body_line_counts: dict[str, int] = field(default_factory=dict)
     bare_names: dict[str, str] = field(default_factory=dict)  # qname -> short_name
@@ -1008,8 +1009,18 @@ class CodeAwareCompressor(Transform):
         body_line_counts: dict[str, int] = {}
         for qname, node in definitions.items():
             collect_calls_in_function(node, qname)
-            node_text = _slice_code_bytes(code, node.start_byte, node.end_byte)
-            body_line_counts[qname] = max(1, len(node_text.split("\n")) - 2)
+            body_line_counts[qname] = max(1, node.end_point[0] - node.start_point[0] - 1)
+
+        # Resolve the short-name lookup once.  The omitted-body comment only
+        # needs the first matching qualified symbol, but scanning every
+        # qualified name for every function made large files quadratic.
+        calls_by_bare_name: dict[str, set[str]] = {}
+        for qname, called in function_calls.items():
+            short_name = bare_names[qname]
+            if qname == short_name:
+                calls_by_bare_name[short_name] = called
+            elif short_name not in calls_by_bare_name:
+                calls_by_bare_name[short_name] = called
 
         # Reference counts: subtract definition occurrences
         short_name_def_count: dict[str, int] = {}
@@ -1064,12 +1075,18 @@ class CodeAwareCompressor(Transform):
         return _SymbolAnalysis(
             scores=scores,
             calls=function_calls,
+            calls_by_bare_name=calls_by_bare_name,
             ref_counts=ref_counts,
             body_line_counts=body_line_counts,
             bare_names=bare_names,
         )
 
-    def _allocate_body_budget(self, analysis: _SymbolAnalysis, code: str) -> dict[str, int]:
+    def _allocate_body_budget(
+        self,
+        analysis: _SymbolAnalysis,
+        code: str,
+        total_lines: int | None = None,
+    ) -> dict[str, int]:
         """Allocate body line budget across functions using target_compression_rate.
 
         Returns dict mapping symbol name to max body lines to keep.
@@ -1081,7 +1098,8 @@ class CodeAwareCompressor(Transform):
         body_sizes = analysis.body_line_counts
         target_rate = self.config.target_compression_rate
 
-        total_lines = len(code.strip().split("\n"))
+        if total_lines is None:
+            total_lines = len(code.strip().split("\n"))
         total_body_lines = sum(body_sizes.values())
         fixed_lines = max(0, total_lines - total_body_lines)
 
@@ -1365,15 +1383,15 @@ class CodeAwareCompressor(Transform):
             Tuple of (compressed code, extracted structure, symbol scores).
         """
         parser = _get_parser(language.value)
-        tree = parser.parse(bytes(code, "utf-8"))
+        code_bytes = code.encode("utf-8")
+        code_lines = code.split("\n")
+        tree = parser.parse(code_bytes)
         root = tree.root_node
         candidate_validator: Callable[[Any, str], str] | None = None
 
         if recover_invalid_python_nodes and language == CodeLanguage.PYTHON:
-            code_bytes = code.encode("utf-8")
-
             def candidate_validator(node: Any, candidate_text: str) -> str:
-                original_text = _slice_code_bytes(code, node.start_byte, node.end_byte)
+                original_text = _slice_code_bytes(code_bytes, node.start_byte, node.end_byte)
                 if candidate_text == original_text:
                     return candidate_text
                 candidate_module = (
@@ -1387,7 +1405,11 @@ class CodeAwareCompressor(Transform):
 
         # Analyze symbol importance and allocate compression budget
         analysis = self._analyze_symbol_importance(root, code, language, context)
-        body_limits = self._allocate_body_budget(analysis, code)
+        body_limits = self._allocate_body_budget(
+            analysis,
+            code,
+            total_lines=len(code.strip().split("\n")),
+        )
 
         # Extract structure using data-driven language config
         lang_config = _LANG_CONFIGS.get(language)
@@ -1399,10 +1421,12 @@ class CodeAwareCompressor(Transform):
                 lang_config,
                 body_limits,
                 analysis,
+                code_lines=code_lines,
+                code_bytes=code_bytes,
                 candidate_validator=candidate_validator,
             )
         else:
-            structure = self._extract_generic_structure(root, code)
+            structure = self._extract_generic_structure(root, code, code_lines)
 
         # Assemble compressed code
         compressed = self._assemble_compressed(structure, language)
@@ -1429,6 +1453,8 @@ class CodeAwareCompressor(Transform):
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
+        code_lines: list[str] | None = None,
+        code_bytes: bytes | None = None,
         candidate_validator: Callable[[Any, str], str] | None = None,
     ) -> CodeStructure:
         """Extract structure from AST using data-driven language config.
@@ -1438,6 +1464,8 @@ class CodeAwareCompressor(Transform):
         """
         structure = CodeStructure()
         captured_byte_ranges: list[tuple[int, int]] = []
+        source_lines = code_lines if code_lines is not None else code.split("\n")
+        source_bytes = code_bytes if code_bytes is not None else code.encode("utf-8")
 
         def _validated_candidate(node: Any, compressed: str) -> str:
             if candidate_validator is None:
@@ -1449,22 +1477,28 @@ class CodeAwareCompressor(Transform):
 
             # Package declarations (Go, Java)
             if lang_config.package_node and node_type == lang_config.package_node:
-                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
-                structure.imports.insert(0, leading + _get_node_text(node, code))
+                leading = _get_leading_comment_text(
+                    node, code, captured_byte_ranges, source_bytes
+                )
+                structure.imports.insert(0, leading + _get_node_text(node, code, source_bytes))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
             # Import statements
             if node_type in lang_config.import_nodes:
-                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
-                structure.imports.append(leading + _get_node_text(node, code))
+                leading = _get_leading_comment_text(
+                    node, code, captured_byte_ranges, source_bytes
+                )
+                structure.imports.append(leading + _get_node_text(node, code, source_bytes))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
             # Export statements (JS/TS) — may contain functions or re-exports
             if node_type == "export_statement":
-                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
-                text = _get_node_text(node, code)
+                leading = _get_leading_comment_text(
+                    node, code, captured_byte_ranges, source_bytes
+                )
+                text = _get_node_text(node, code, source_bytes)
                 # Check if this export wraps a function or class
                 has_func_or_class = False
                 for child in node.children:
@@ -1474,11 +1508,22 @@ class CodeAwareCompressor(Transform):
                     ):
                         has_func_or_class = True
                         compressed = self._compress_function_ast(
-                            child, code, language, lang_config, body_limits, analysis
+                            child,
+                            code,
+                            language,
+                            lang_config,
+                            body_limits,
+                            analysis,
+                            source_lines,
+                            source_bytes,
                         )
                         # Reconstruct export with compressed inner definition
-                        export_prefix = _slice_code_bytes(code, node.start_byte, child.start_byte)
-                        export_suffix = _slice_code_bytes(code, child.end_byte, node.end_byte)
+                        export_prefix = _slice_code_bytes(
+                            source_bytes, node.start_byte, child.start_byte
+                        )
+                        export_suffix = _slice_code_bytes(
+                            source_bytes, child.end_byte, node.end_byte
+                        )
                         structure.function_signatures.append(
                             leading
                             + _validated_candidate(
@@ -1494,19 +1539,35 @@ class CodeAwareCompressor(Transform):
 
             # Decorated definitions (Python)
             if lang_config.decorator_node and node_type == lang_config.decorator_node:
-                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
+                leading = _get_leading_comment_text(
+                    node, code, captured_byte_ranges, source_bytes
+                )
                 decorator_text = []
                 definition_compressed = None
                 for child in node.children:
                     if child.type == "decorator":
-                        decorator_text.append(_get_node_text(child, code))
+                        decorator_text.append(_get_node_text(child, code, source_bytes))
                     elif child.type in lang_config.function_nodes:
                         definition_compressed = self._compress_function_ast(
-                            child, code, language, lang_config, body_limits, analysis
+                            child,
+                            code,
+                            language,
+                            lang_config,
+                            body_limits,
+                            analysis,
+                            source_lines,
+                            source_bytes,
                         )
                     elif child.type in lang_config.class_nodes:
                         definition_compressed = self._compress_class_ast(
-                            child, code, language, lang_config, body_limits, analysis
+                            child,
+                            code,
+                            language,
+                            lang_config,
+                            body_limits,
+                            analysis,
+                            source_lines,
+                            source_bytes,
                         )
                 if decorator_text and definition_compressed:
                     full_def = _validated_candidate(
@@ -1529,9 +1590,18 @@ class CodeAwareCompressor(Transform):
 
             # Function/method definitions
             if node_type in lang_config.function_nodes:
-                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
+                leading = _get_leading_comment_text(
+                    node, code, captured_byte_ranges, source_bytes
+                )
                 compressed = self._compress_function_ast(
-                    node, code, language, lang_config, body_limits, analysis
+                    node,
+                    code,
+                    language,
+                    lang_config,
+                    body_limits,
+                    analysis,
+                    source_lines,
+                    source_bytes,
                 )
                 structure.function_signatures.append(
                     leading + _validated_candidate(node, compressed)
@@ -1541,7 +1611,14 @@ class CodeAwareCompressor(Transform):
 
             if lang_config.container_node_types and node_type in lang_config.container_node_types:
                 compressed = self._compress_class_ast(
-                    node, code, language, lang_config, body_limits, analysis
+                    node,
+                    code,
+                    language,
+                    lang_config,
+                    body_limits,
+                    analysis,
+                    source_lines,
+                    source_bytes,
                 )
                 structure.class_definitions.append(_validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
@@ -1549,9 +1626,18 @@ class CodeAwareCompressor(Transform):
 
             # Class definitions — compress each method individually
             if node_type in lang_config.class_nodes:
-                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
+                leading = _get_leading_comment_text(
+                    node, code, captured_byte_ranges, source_bytes
+                )
                 compressed = self._compress_class_ast(
-                    node, code, language, lang_config, body_limits, analysis
+                    node,
+                    code,
+                    language,
+                    lang_config,
+                    body_limits,
+                    analysis,
+                    source_lines,
+                    source_bytes,
                 )
                 structure.class_definitions.append(leading + _validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
@@ -1564,8 +1650,12 @@ class CodeAwareCompressor(Transform):
 
             # Type definitions
             if node_type in lang_config.type_nodes:
-                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
-                structure.type_definitions.append(leading + _get_node_text(node, code))
+                leading = _get_leading_comment_text(
+                    node, code, captured_byte_ranges, source_bytes
+                )
+                structure.type_definitions.append(
+                    leading + _get_node_text(node, code, source_bytes)
+                )
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -1588,9 +1678,9 @@ class CodeAwareCompressor(Transform):
                     for t in child_types
                 )
                 if has_import and not has_declaration:
-                    structure.imports.append(_get_node_text(node, code))
+                    structure.imports.append(_get_node_text(node, code, source_bytes))
                 else:
-                    structure.top_level_code.append(_get_node_text(node, code))
+                    structure.top_level_code.append(_get_node_text(node, code, source_bytes))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -1612,7 +1702,7 @@ class CodeAwareCompressor(Transform):
         for child in root.children:
             child_range = (child.start_byte, child.end_byte)
             if child_range not in captured_byte_ranges:
-                text = _get_node_text(child, code).strip()
+                text = _get_node_text(child, code, source_bytes).strip()
                 if text:
                     if first_captured is not None and child.end_byte <= first_captured:
                         structure.header_code.append(text)
@@ -1633,6 +1723,8 @@ class CodeAwareCompressor(Transform):
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
+        source_lines: list[str] | None = None,
+        source_bytes: bytes | None = None,
     ) -> str:
         """Compress a function/class/impl block using AST body detection.
 
@@ -1646,9 +1738,9 @@ class CodeAwareCompressor(Transform):
         # Use line-based slicing from original code (not byte offsets) to
         # preserve indentation. This is critical for nested definitions
         # (methods inside classes).
-        code_lines = code.split("\n")
+        source_lines = source_lines if source_lines is not None else code.split("\n")
         start_row = node.start_point[0]
-        node_lines = _get_node_lines(node, code_lines)
+        node_lines = _get_node_lines(node, source_lines)
         node_text = "\n".join(node_lines)
 
         func_name = _get_definition_name(node)
@@ -1843,7 +1935,7 @@ class CodeAwareCompressor(Transform):
         total_body_lines_count = sum(end - start + 1 for start, end in body_stmts)
 
         for start_row, end_row in body_stmts:
-            stmt_lines = code_lines[start_row : end_row + 1]
+            stmt_lines = source_lines[start_row : end_row + 1]
             stmt_line_count = len(stmt_lines)
 
             # If adding this statement would exceed budget and we already have
@@ -1864,7 +1956,11 @@ class CodeAwareCompressor(Transform):
         if signature_lines:
             result_parts.extend(signature_lines)
         else:
-            sig_text = _slice_code_bytes(code, node.start_byte, body_node.start_byte).rstrip()
+            sig_text = _slice_code_bytes(
+                source_bytes if source_bytes is not None else code,
+                node.start_byte,
+                body_node.start_byte,
+            ).rstrip()
             result_parts.append(sig_text)
 
         if opening_brace_line is not None:
@@ -1903,6 +1999,8 @@ class CodeAwareCompressor(Transform):
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
+        source_lines: list[str] | None = None,
+        source_bytes: bytes | None = None,
     ) -> str:
         """Compress a class by individually compressing each method.
 
@@ -1911,9 +2009,9 @@ class CodeAwareCompressor(Transform):
         indentation for each method's omitted-body comment.
         """
         # Use line-based extraction to preserve indentation
-        code_lines = code.split("\n")
+        source_lines = source_lines if source_lines is not None else code.split("\n")
         start_row = node.start_point[0]
-        node_lines = _get_node_lines(node, code_lines)
+        node_lines = _get_node_lines(node, source_lines)
         node_text = "\n".join(node_lines)
 
         # Find the class/member container. For some languages this is not the
@@ -1953,12 +2051,19 @@ class CodeAwareCompressor(Transform):
             child_end = child.end_point[0]
             if child.end_point[1] == 0 and child_end > child_start:
                 child_end -= 1
-            child_text = "\n".join(code_lines[child_start : child_end + 1])
+            child_text = "\n".join(source_lines[child_start : child_end + 1])
 
             # Methods/functions inside the class — compress individually
             if child.type in lang_config.function_nodes:
                 compressed = self._compress_function_ast(
-                    child, code, language, lang_config, body_limits, analysis
+                    child,
+                    code,
+                    language,
+                    lang_config,
+                    body_limits,
+                    analysis,
+                    source_lines,
+                    source_bytes,
                 )
                 body_parts.append(compressed)
                 processed_ranges.append((child.start_byte, child.end_byte))
@@ -1970,10 +2075,17 @@ class CodeAwareCompressor(Transform):
                     if deco_child.type == "decorator":
                         deco_start = deco_child.start_point[0]
                         deco_end = deco_child.end_point[0]
-                        decorator_lines.append("\n".join(code_lines[deco_start : deco_end + 1]))
+                        decorator_lines.append("\n".join(source_lines[deco_start : deco_end + 1]))
                     elif deco_child.type in lang_config.function_nodes:
                         method_compressed = self._compress_function_ast(
-                            deco_child, code, language, lang_config, body_limits, analysis
+                            deco_child,
+                            code,
+                            language,
+                            lang_config,
+                            body_limits,
+                            analysis,
+                            source_lines,
+                            source_bytes,
                         )
                 if decorator_lines and method_compressed:
                     body_parts.append("\n".join(decorator_lines) + "\n" + method_compressed)
@@ -1987,7 +2099,14 @@ class CodeAwareCompressor(Transform):
                 lang_config.container_node_types and child.type in lang_config.container_node_types
             ):
                 compressed = self._compress_class_ast(
-                    child, code, language, lang_config, body_limits, analysis
+                    child,
+                    code,
+                    language,
+                    lang_config,
+                    body_limits,
+                    analysis,
+                    source_lines,
+                    source_bytes,
                 )
                 body_parts.append(compressed)
                 processed_ranges.append((child.start_byte, child.end_byte))
@@ -2012,7 +2131,7 @@ class CodeAwareCompressor(Transform):
         after_lines = node_lines[body_end_rel:]
         if not lang_config.uses_colon_after_signature:
             if body_end_line != start_row:
-                closing_line = code_lines[body_end_line]
+                closing_line = source_lines[body_end_line]
                 closing_text = closing_line[: body_node.end_point[1]]
                 if _get_same_line_trailing_semicolon(node) is not None:
                     closing_text += ";"
@@ -2023,14 +2142,19 @@ class CodeAwareCompressor(Transform):
 
         return "\n".join(result_parts)
 
-    def _extract_generic_structure(self, root: Any, code: str) -> CodeStructure:
+    def _extract_generic_structure(
+        self,
+        root: Any,
+        code: str,
+        code_lines: list[str] | None = None,
+    ) -> CodeStructure:
         """Extract structure from generic/unknown code.
 
         For languages without a LangConfig, we can't reliably separate
         imports from other code. Just preserve everything in 'other'.
         """
         structure = CodeStructure()
-        structure.other = code.split("\n")
+        structure.other = code_lines if code_lines is not None else code.split("\n")
         return structure
 
     def _assemble_compressed(
@@ -2306,21 +2430,29 @@ class CodeAwareCompressor(Transform):
 # =========================================================================
 
 
-def _slice_code_bytes(code: str, start_byte: int, end_byte: int) -> str:
+def _slice_code_bytes(code: str | bytes, start_byte: int, end_byte: int) -> str:
     """Extract source text using tree-sitter UTF-8 byte offsets."""
-    return code.encode("utf-8")[start_byte:end_byte].decode("utf-8")
+    code_bytes = code if isinstance(code, bytes) else code.encode("utf-8")
+    return code_bytes[start_byte:end_byte].decode("utf-8")
 
 
-def _get_node_text(node: Any, code: str) -> str:
+def _get_node_text(node: Any, code: str, code_bytes: bytes | None = None) -> str:
     """Extract text from AST node."""
-    return _slice_code_bytes(code, node.start_byte, node.end_byte)
+    return _slice_code_bytes(
+        code_bytes if code_bytes is not None else code,
+        node.start_byte,
+        node.end_byte,
+    )
 
 
 _COMMENT_NODE_TYPES = frozenset({"comment", "line_comment", "block_comment"})
 
 
 def _get_leading_comment_text(
-    node: Any, code: str, captured_byte_ranges: list[tuple[int, int]]
+    node: Any,
+    code: str,
+    captured_byte_ranges: list[tuple[int, int]],
+    code_bytes: bytes | None = None,
 ) -> str:
     """Collect contiguous doc-comment siblings immediately preceding a node.
 
@@ -2345,7 +2477,7 @@ def _get_leading_comment_text(
         return ""
     comments.reverse()
     captured_byte_ranges.extend((c.start_byte, c.end_byte) for c in comments)
-    return "\n".join(_get_node_text(c, code) for c in comments) + "\n"
+    return "\n".join(_get_node_text(c, code, code_bytes) for c in comments) + "\n"
 
 
 def _get_node_lines(node: Any, code_lines: list[str]) -> list[str]:
@@ -2460,18 +2592,22 @@ def _make_omitted_comment(
     """Build omitted comment with call information from analysis."""
     calls_info = ""
     if analysis and func_name:
-        for key in (
-            func_name,
-            *(k for k in analysis.calls if k.endswith(f".{func_name}")),
-        ):
-            if key in analysis.calls:
-                called = analysis.calls[key]
-                if called:
-                    sorted_calls = sorted(called)[:5]
-                    calls_info = "; calls: " + ", ".join(sorted_calls)
-                    if len(called) > 5:
-                        calls_info += f" +{len(called) - 5} more"
-                break
+        called = analysis.calls_by_bare_name.get(func_name)
+        # Keep compatibility for analysis objects created by older callers or
+        # tests that only populate ``calls``.
+        if called is None:
+            called = analysis.calls.get(func_name)
+            if called is None:
+                suffix = f".{func_name}"
+                for key, candidate in analysis.calls.items():
+                    if key.endswith(suffix):
+                        called = candidate
+                        break
+        if called:
+            sorted_calls = sorted(called)[:5]
+            calls_info = "; calls: " + ", ".join(sorted_calls)
+            if len(called) > 5:
+                calls_info += f" +{len(called) - 5} more"
     return f"{indent}{comment_prefix} [{omitted_count} lines omitted{calls_info}]"
 
 
