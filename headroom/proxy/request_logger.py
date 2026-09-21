@@ -21,11 +21,11 @@ but the label is now accurate for any future Unicode payload).
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import sys
 from collections import deque
+from copy import deepcopy
 from dataclasses import asdict, fields
 from pathlib import Path
 from threading import Lock
@@ -36,13 +36,6 @@ if TYPE_CHECKING:
 
 from headroom.proxy import request_log_redaction_policy
 from headroom.proxy.models import RequestLog
-
-# Fields ``get_recent`` never returns. Kept as a module constant so the
-# projection below stays in step with the docstring.
-RECENT_OMITTED_FIELDS = ("request_messages", "compressed_messages", "response_content")
-_RECENT_FIELDS: tuple[str, ...] = tuple(
-    f.name for f in fields(RequestLog) if f.name not in RECENT_OMITTED_FIELDS
-)
 
 IMAGE_BASE64_REDACT_THRESHOLD_BYTES = (
     request_log_redaction_policy.IMAGE_BASE64_REDACT_THRESHOLD_BYTES
@@ -88,6 +81,14 @@ def redact_image_base64(payload: Any) -> Any:
         with _redactions_lock:
             _redactions_total += result.redactions
     return result.value
+
+
+# Payload fields `get_recent` never returns and therefore must never walk.
+_HEAVY_FIELDS = frozenset({"request_messages", "compressed_messages", "response_content"})
+# Resolved once: the projection is per-entry and `fields()` is not free.
+_RECENT_FIELDS: tuple[str, ...] = tuple(
+    f.name for f in fields(RequestLog) if f.name not in _HEAVY_FIELDS
+)
 
 
 class RequestLogger:
@@ -154,31 +155,32 @@ class RequestLogger:
     def get_recent(self, n: int = 100) -> list[dict]:
         """Get recent log entries (without request/compressed messages and response_content).
 
-        Project the kept fields directly instead of going through ``asdict``.
-        ``asdict`` rebuilds and deep-copies *every* field and only then drops
-        the three omitted ones, so `/stats` paid for a full copy of the
-        10,000-entry buffer — including the message bodies — and threw most of
-        it away, twice per request (``server.py`` :4057 and :4257).
-
-        The remaining fields that can hold mutable state are still deep-copied,
-        so the previous guarantee holds: nothing a caller does to a returned
-        row — including a nested dict inside ``savings_breakdown`` or ``tags``
-        — can reach the buffered ``RequestLog``. What is skipped is the copy of
-        the omitted fields and the rebuild of the immutable scalars, which are
-        safe to share. Output is unchanged.
+        Projects the kept fields directly rather than going through ``asdict``.
+        Nothing a caller does to a returned row — including a nested dict inside
+        ``savings_breakdown`` or ``tags`` — can reach the buffered
+        ``RequestLog``. Output is unchanged.
         """
         # Convert deque to list for slicing (deque doesn't support slicing)
         entries = list(self._logs)[-n:]
+        # Not asdict(): that deep-copies every field BEFORE the heavy ones are
+        # dropped, so each entry cost a full walk of its request_messages and
+        # compressed_messages (~3.4 ms for a 400 KB Claude Code transcript).
+        # /stats calls this with n=10_000 synchronously on the event loop, so
+        # a full deque made every /stats build take ~30 s and a dashboard
+        # polling it starved /v1/messages. The retained fields are still
+        # deep-copied, so callers cannot reach nested containers (tags,
+        # savings_breakdown) that the in-memory log owns.
         recent = []
         for e in entries:
             row = {k: getattr(e, k) for k in _RECENT_FIELDS}
             for k in _RECENT_FIELDS:
                 v = row[k]
-                # ``tags`` is dict[str, Any] and ``savings_breakdown`` is
-                # list[dict[str, Any]]: a shallow copy would still share the
-                # nested children with the buffered entry, so copy in full.
+                # Only a container can be reached and mutated by a caller, so
+                # only ``tags``/``savings_breakdown`` and friends need the walk;
+                # deep-copying the immutable scalars as well costs a dispatch
+                # per field per entry across the whole window.
                 if type(v) is dict or type(v) is list:
-                    row[k] = copy.deepcopy(v)
+                    row[k] = deepcopy(v)
             recent.append(row)
         return recent
 
